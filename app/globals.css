@@ -1,0 +1,25 @@
+@import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css");
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap");
+@import "leaflet/dist/leaflet.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background-color: #0a0e14;
+  color: #e5e9f0;
+}
+
+/* leaflet 기본 타일을 관제실 톤에 맞게 어둡게 */
+.leaflet-container {
+  background: #0a0e14 !important;
+}
+.leaflet-tile-pane {
+  filter: grayscale(1) invert(1) brightness(0.85) contrast(1.1);
+}
+.leaflet-control-attribution {
+  background: rgba(10, 14, 20, 0.7) !important;
+  color: #8b95a7 !important;
+  font-size: 10px !important;
+}
