@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { getSocket, EVENTS } from "./socket";
 import { terminateSession, fetchActiveSessions } from "./api";
 import { geolocateIp } from "./geolocate";
@@ -13,9 +13,40 @@ import {
 } from "@/mock/mockData";
 
 const FORCE_MOCK = process.env.NEXT_PUBLIC_FORCE_MOCK === "true";
-const MAX_EVENTS = 50; // 무한정 쌓이지 않게 최근 N개만 유지
+const MAX_EVENTS = 50;
 
-// 오시은 쪽 trustLevel 값(LOW/HIGH/ZERO_TRUST) → 화면 표시용 Profile 라벨
+// 새로고침/dev 서버 재시작해도 실시간 알림이 안 사라지도록 로컬스토리지에 저장
+const EVENTS_STORAGE_KEY = "zw-dashboard-events";
+const ALERTS_STORAGE_KEY = "zw-dashboard-alerts";
+// "진짜로 소켓 붙어서 mock을 지운 적이 있다"는 것만 나타내는 별도 플래그.
+// 이게 없으면 mock 데이터가 우연히 저장된 것도 "실데이터 있음"으로 착각하게 됨.
+const REAL_DATA_FLAG_KEY = "zw-dashboard-has-real-data";
+
+function loadFromStorage<T>(key: string, fallback: T): T {
+  if (typeof window === "undefined") return fallback; // SSR에서는 localStorage 없음
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback; // 저장된 값이 깨져있으면 그냥 기본값 사용
+  }
+}
+
+function saveToStorage<T>(key: string, value: T) {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // 용량 초과 등으로 저장 실패해도 화면 표시엔 지장 없으니 무시
+  }
+}
+
+function hasRealDataFlag(): boolean {
+  if (typeof window === "undefined") return false;
+  return localStorage.getItem(REAL_DATA_FLAG_KEY) === "true";
+}
+
 function toProfile(trustLevel: string): Profile {
   if (trustLevel === "HIGH") return "High";
   if (trustLevel === "ZERO_TRUST") return "Zero-Trust";
@@ -48,12 +79,25 @@ interface SessionKilledPayload {
 }
 
 /**
- * 오시은 확정 스펙(8/27)의 login:success/login:anomaly payload에는
- * sessionId, 좌표(lat/lng), 국가/도시가 없어서 여기서 직접 채워넣는다.
- *  - sessionId: GET /api/sessions?userId=로 조회해서 가장 최근 세션을 사용
- *    (지도 점 클릭 → 세션 강제종료 하려면 sessionId가 꼭 있어야 함)
- *  - lat/lng/country/city: ipAddress를 geolocateIp()로 조회
+ * 지영 확정(9/23): Wazuh R-01~R-06 탐지룰 전체에서 발행되는 광범위 이상탐지 이벤트.
+ * ⚠️ 실제로 룰마다 필드가 들쭉날쭉 옴 (ip 대신 srcIp로 오거나, ruleName/severity/message가 빠지는 경우 있음,
+ *    timestamp가 아예 안 오는 경우도 있음) → 아래 필드 대부분을 optional로 두고 핸들러에서 방어적으로 처리함.
  */
+export interface AnomalyDetectedPayload {
+  ruleId: string;
+  ruleName?: string;
+  severity?: number;
+  timestamp?: string;
+  ip?: string;
+  srcIp?: string;
+  userId?: string | null;
+  userEmail?: string | null;
+  country?: string | null;
+  message?: string;
+  wazuhRuleId?: string;
+  source?: string;
+}
+
 async function buildLoginEvent(
   payload: LoginSuccessPayload | LoginAnomalyPayload,
   status: "normal" | "alert"
@@ -62,9 +106,7 @@ async function buildLoginEvent(
     geolocateIp(payload.ipAddress),
     fetchActiveSessions(payload.userId).catch(() => []),
   ]);
-
   const latestSession = sessions[sessions.length - 1];
-
   return {
     id: `${payload.userId}-${payload.timestamp}`,
     sessionId: latestSession?.sessionId ?? "",
@@ -81,27 +123,38 @@ async function buildLoginEvent(
   };
 }
 
-/**
- * 대시보드의 "살아있는" 데이터 소스.
- *
- * - 소켓 연결 성공 && FORCE_MOCK이 아니면: 실시간 이벤트로 상태 갱신
- * - 연결 실패 / URL 미설정 / FORCE_MOCK=true: mock 데이터 그대로 사용 (개발·시연용)
- */
 export function useLiveDashboard() {
-  const [events, setEvents] = useState<LoginEvent[]>(mockLoginEvents);
-  const [alerts, setAlerts] = useState<AlertEvent[]>(mockAlerts);
+  // 실데이터 플래그가 true일 때만 로컬스토리지 값을 신뢰해서 불러오고,
+  // 아니면(=한 번도 소켓에서 실데이터를 받아 mock을 지운 적 없으면) mock으로 시작
+  const [events, setEvents] = useState<LoginEvent[]>(() =>
+    hasRealDataFlag() ? loadFromStorage(EVENTS_STORAGE_KEY, mockLoginEvents) : mockLoginEvents
+  );
+  const [alerts, setAlerts] = useState<AlertEvent[]>(() =>
+    hasRealDataFlag() ? loadFromStorage(ALERTS_STORAGE_KEY, mockAlerts) : mockAlerts
+  );
   const [connected, setConnected] = useState(false);
   const [usingMock, setUsingMock] = useState(true);
+
+  // 이미 실데이터 플래그가 true였다면(=예전에 이미 mock을 한 번 지운 적 있음) 다시 지울 필요 없음
+  const hasClearedMock = useRef(hasRealDataFlag());
+
+  // events/alerts가 바뀔 때마다 로컬스토리지에 계속 반영
+  // (mock을 아직 지운 적 없는 상태에서 저장돼도 상관없음 - 플래그가 true가 되기 전까진 다음 로드 때 무시됨)
+  useEffect(() => {
+    saveToStorage(EVENTS_STORAGE_KEY, events);
+  }, [events]);
+
+  useEffect(() => {
+    saveToStorage(ALERTS_STORAGE_KEY, alerts);
+  }, [alerts]);
 
   useEffect(() => {
     if (FORCE_MOCK) {
       setUsingMock(true);
       return;
     }
-
     const socket = getSocket();
     if (!socket) {
-      // NEXT_PUBLIC_SOCKET_URL이 비어있는 경우 → mock 유지
       setUsingMock(true);
       return;
     }
@@ -109,10 +162,15 @@ export function useLiveDashboard() {
     const handleConnect = () => {
       setConnected(true);
       setUsingMock(false);
+      if (!hasClearedMock.current) {
+        hasClearedMock.current = true;
+        setEvents([]);
+        setAlerts([]);
+        saveToStorage(REAL_DATA_FLAG_KEY, "true"); // 이제부터는 저장된 값을 실데이터로 신뢰해도 됨
+      }
     };
     const handleDisconnect = () => {
       setConnected(false);
-      // 연결이 끊겨도 지금까지 받은 실데이터는 유지 (mock으로 되돌리지 않음)
     };
 
     const handleLoginNew = async (payload: LoginSuccessPayload) => {
@@ -128,7 +186,6 @@ export function useLiveDashboard() {
           {
             id: event.id,
             sessionId: event.sessionId,
-            // 오시은 쪽엔 룰 코드(R-01~06)가 없고 자유 텍스트 reason만 있어서 그대로 라벨로 사용
             ruleLabel: payload.reason,
             ip: event.ip,
             country: event.country,
@@ -145,11 +202,33 @@ export function useLiveDashboard() {
       setAlerts((prev) => prev.filter((a) => a.sessionId !== payload.sessionId));
     };
 
+    const handleAnomalyDetected = (payload: AnomalyDetectedPayload) => {
+      const ip = payload.ip ?? payload.srcIp ?? "-";
+      const ruleLabel = payload.ruleName ? `${payload.ruleId} · ${payload.ruleName}` : payload.ruleId;
+      // timestamp가 안 올 수도 있어서 id는 절대 겹치지 않도록 별도 조합
+      const uniqueSuffix = `${payload.timestamp ?? Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      setAlerts((prev) =>
+        [
+          {
+            id: `${payload.ruleId}-${uniqueSuffix}`,
+            sessionId: "",
+            ruleLabel,
+            ip,
+            country: payload.country ?? "",
+            time: payload.timestamp ?? new Date().toISOString(),
+            severity: "high" as const,
+          },
+          ...prev,
+        ].slice(0, MAX_EVENTS)
+      );
+    };
+
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
     socket.on(EVENTS.LOGIN_NEW, handleLoginNew);
     socket.on(EVENTS.ALERT_DETECTED, handleAlertDetected);
     socket.on(EVENTS.SESSION_TERMINATED, handleSessionTerminated);
+    socket.on(EVENTS.ANOMALY_DETECTED, handleAnomalyDetected);
 
     return () => {
       socket.off("connect", handleConnect);
@@ -157,24 +236,22 @@ export function useLiveDashboard() {
       socket.off(EVENTS.LOGIN_NEW, handleLoginNew);
       socket.off(EVENTS.ALERT_DETECTED, handleAlertDetected);
       socket.off(EVENTS.SESSION_TERMINATED, handleSessionTerminated);
+      socket.off(EVENTS.ANOMALY_DETECTED, handleAnomalyDetected);
     };
   }, []);
 
   const handleTerminate = useCallback(
     async (sessionId: string) => {
-      // 낙관적 업데이트: 서버 응답 기다리지 않고 UI 먼저 반영
+      if (!sessionId) return; // sessionId 없는 항목(인프라 이상탐지)은 종료 대상이 아니므로 아예 무시
+
       setEvents((prev) => prev.filter((e) => e.sessionId !== sessionId));
       setAlerts((prev) => prev.filter((a) => a.sessionId !== sessionId));
 
-      if (usingMock || !sessionId) return; // mock 모드거나 sessionId 확보 못했으면 REST 호출 안 함
+      if (usingMock) return;
 
       try {
-        // 오시은 확정(8/27): socket으로 "종료해줘" 요청하는 이벤트는 없음.
-        // 종료는 항상 REST(POST /api/session/kill)로 요청하고,
-        // 성공하면 서버가 session:killed를 소켓으로 방송해준다.
         await terminateSession(sessionId, "대시보드 관리자 강제 종료");
       } catch (err) {
-        // TODO: 실패 시 토스트/알림 UI로 사용자에게 알리기 (지금은 콘솔 로그만)
         console.error("세션 종료 요청 실패:", err);
       }
     },

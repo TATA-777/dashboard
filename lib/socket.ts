@@ -33,6 +33,7 @@ export const EVENTS = {
   LOGIN_NEW: "login:success",
   ALERT_DETECTED: "login:anomaly",
   SESSION_TERMINATED: "session:killed", // 서버 → 클라이언트 (응답/브로드캐스트)
+  ANOMALY_DETECTED: "event:anomaly-detected", // 지영 확정(9/23): Wazuh R-01~R-06 탐지 전체 (로그인 무관 인프라 공격 포함)
 } as const;
 
 let socketInstance: Socket | null = null;
