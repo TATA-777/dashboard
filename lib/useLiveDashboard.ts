@@ -13,7 +13,8 @@ import {
 } from "@/mock/mockData";
 
 const FORCE_MOCK = process.env.NEXT_PUBLIC_FORCE_MOCK === "true";
-const MAX_EVENTS = 50;
+const MAX_EVENTS = 50; // 지도 점(events)용
+const MAX_ALERTS = 1000; // 알림은 사실상 무제한 (관리자가 직접 지울 때만 삭제)
 
 // 새로고침/dev 서버 재시작해도 실시간 알림이 안 사라지도록 로컬스토리지에 저장
 const EVENTS_STORAGE_KEY = "zw-dashboard-events";
@@ -42,9 +43,22 @@ function saveToStorage<T>(key: string, value: T) {
   }
 }
 
+// ⚠️ 수정(9/28): 예전엔 saveToStorage(JSON.stringify)로 저장해서 '"true"'(따옴표 포함)가 들어갔는데
+// 읽을 땐 "true"와 비교해서 항상 false → 새로고침마다 알림이 초기화되던 버그.
+// 플래그는 JSON 없이 raw 문자열로 저장하고, 예전에 잘못 저장된 '"true"'도 인정한다.
 function hasRealDataFlag(): boolean {
   if (typeof window === "undefined") return false;
-  return localStorage.getItem(REAL_DATA_FLAG_KEY) === "true";
+  const v = localStorage.getItem(REAL_DATA_FLAG_KEY);
+  return v === "true" || v === '"true"';
+}
+
+function setRealDataFlag() {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(REAL_DATA_FLAG_KEY, "true");
+  } catch {
+    // 무시
+  }
 }
 
 function toProfile(trustLevel: string): Profile {
@@ -126,11 +140,12 @@ async function buildLoginEvent(
 export function useLiveDashboard() {
   // 실데이터 플래그가 true일 때만 로컬스토리지 값을 신뢰해서 불러오고,
   // 아니면(=한 번도 소켓에서 실데이터를 받아 mock을 지운 적 없으면) mock으로 시작
+  // 플래그가 true인데 저장값이 없으면 mock이 아니라 빈 배열로 시작
   const [events, setEvents] = useState<LoginEvent[]>(() =>
-    hasRealDataFlag() ? loadFromStorage(EVENTS_STORAGE_KEY, mockLoginEvents) : mockLoginEvents
+    hasRealDataFlag() ? loadFromStorage<LoginEvent[]>(EVENTS_STORAGE_KEY, []) : mockLoginEvents
   );
   const [alerts, setAlerts] = useState<AlertEvent[]>(() =>
-    hasRealDataFlag() ? loadFromStorage(ALERTS_STORAGE_KEY, mockAlerts) : mockAlerts
+    hasRealDataFlag() ? loadFromStorage<AlertEvent[]>(ALERTS_STORAGE_KEY, []) : mockAlerts
   );
   const [connected, setConnected] = useState(false);
   const [usingMock, setUsingMock] = useState(true);
@@ -139,7 +154,6 @@ export function useLiveDashboard() {
   const hasClearedMock = useRef(hasRealDataFlag());
 
   // events/alerts가 바뀔 때마다 로컬스토리지에 계속 반영
-  // (mock을 아직 지운 적 없는 상태에서 저장돼도 상관없음 - 플래그가 true가 되기 전까진 다음 로드 때 무시됨)
   useEffect(() => {
     saveToStorage(EVENTS_STORAGE_KEY, events);
   }, [events]);
@@ -166,7 +180,7 @@ export function useLiveDashboard() {
         hasClearedMock.current = true;
         setEvents([]);
         setAlerts([]);
-        saveToStorage(REAL_DATA_FLAG_KEY, "true"); // 이제부터는 저장된 값을 실데이터로 신뢰해도 됨
+        setRealDataFlag(); // 이제부터는 저장된 값을 실데이터로 신뢰해도 됨
       }
     };
     const handleDisconnect = () => {
@@ -193,11 +207,14 @@ export function useLiveDashboard() {
             severity: "high" as const,
           },
           ...prev,
-        ].slice(0, MAX_EVENTS)
+        ].slice(0, MAX_ALERTS)
       );
     };
 
+    // 서버에서 세션 종료 브로드캐스트가 오면 해당 세션에 연결된 항목만 제거
+    // (sessionId가 빈 값이면 Wazuh 알림 전체가 지워지는 사고 방지)
     const handleSessionTerminated = (payload: SessionKilledPayload) => {
+      if (!payload.sessionId) return;
       setEvents((prev) => prev.filter((e) => e.sessionId !== payload.sessionId));
       setAlerts((prev) => prev.filter((a) => a.sessionId !== payload.sessionId));
     };
@@ -219,7 +236,7 @@ export function useLiveDashboard() {
             severity: "high" as const,
           },
           ...prev,
-        ].slice(0, MAX_EVENTS)
+        ].slice(0, MAX_ALERTS)
       );
     };
 
@@ -240,17 +257,23 @@ export function useLiveDashboard() {
     };
   }, []);
 
-  const handleTerminate = useCallback(
-    async (sessionId: string) => {
-      if (!sessionId) return; // sessionId 없는 항목(인프라 이상탐지)은 종료 대상이 아니므로 아예 무시
+  /**
+   * 알림 삭제 (9/28 수정)
+   * - 알림은 무조건 id 기준으로 삭제 → Wazuh 알림(sessionId 없음)도 정상 삭제됨
+   * - sessionId가 있는 알림(로그인 이상탐지)은 세션 강제 종료까지 수행
+   */
+  const handleDismiss = useCallback(
+    async (alert: AlertEvent) => {
+      setAlerts((prev) => prev.filter((a) => a.id !== alert.id));
 
-      setEvents((prev) => prev.filter((e) => e.sessionId !== sessionId));
-      setAlerts((prev) => prev.filter((a) => a.sessionId !== sessionId));
+      if (!alert.sessionId) return;
+
+      setEvents((prev) => prev.filter((e) => e.sessionId !== alert.sessionId));
 
       if (usingMock) return;
 
       try {
-        await terminateSession(sessionId, "대시보드 관리자 강제 종료");
+        await terminateSession(alert.sessionId, "대시보드 관리자 강제 종료");
       } catch (err) {
         console.error("세션 종료 요청 실패:", err);
       }
@@ -258,5 +281,5 @@ export function useLiveDashboard() {
     [usingMock]
   );
 
-  return { events, alerts, connected, usingMock, handleTerminate };
+  return { events, alerts, connected, usingMock, handleDismiss };
 }

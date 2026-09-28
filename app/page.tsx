@@ -36,7 +36,7 @@ const ProfileDistChart = dynamic(() => import("@/components/Charts/ProfileDistCh
 });
 
 export default function DashboardPage() {
-  const { events, alerts, connected, usingMock, handleTerminate } = useLiveDashboard();
+  const { events, alerts, connected, usingMock, handleDismiss } = useLiveDashboard();
   const { loginTrend, ruleHits, profileDist } = useDashboardStats();
 
   return (
@@ -52,7 +52,7 @@ export default function DashboardPage() {
           <div className="h-[420px]">
             <AlertList
               alerts={alerts}
-              onTerminate={handleTerminate}
+              onDismiss={handleDismiss}
               reconnecting={!usingMock && !connected}
             />
           </div>

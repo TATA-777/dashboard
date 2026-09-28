@@ -6,7 +6,11 @@ import type { AlertEvent } from "@/mock/mockData";
 function formatTimeAgo(iso: string) {
   const diffSec = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
   if (diffSec < 60) return `${diffSec}초 전`;
-  return `${Math.floor(diffSec / 60)}분 전`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}분 전`;
+  const diffHour = Math.floor(diffMin / 60);
+  if (diffHour < 24) return `${diffHour}시간 전`;
+  return `${Math.floor(diffHour / 24)}일 전`;
 }
 
 // 서버 렌더링 시점과 브라우저 렌더링 시점의 "지금"이 달라서 생기는
@@ -27,22 +31,22 @@ function useTimeAgo(iso: string) {
 
 function AlertItem({
   alert,
-  onTerminate,
+  onDismiss,
 }: {
   alert: AlertEvent;
-  onTerminate: (sessionId: string) => void;
+  onDismiss: (alert: AlertEvent) => void;
 }) {
   const [confirming, setConfirming] = useState(false);
-  const [terminated, setTerminated] = useState(false);
   const timeLabel = useTimeAgo(alert.time);
+  // sessionId가 있으면 로그인 이상탐지(세션 종료 대상), 없으면 Wazuh 인프라 알림(삭제만)
+  const hasSession = !!alert.sessionId;
 
   const handleClick = () => {
     if (!confirming) {
       setConfirming(true);
       return;
     }
-    onTerminate(alert.sessionId);
-    setTerminated(true);
+    onDismiss(alert); // 목록에서 즉시 제거됨 (별도 "종료됨" 상태 없음)
   };
 
   return (
@@ -60,35 +64,38 @@ function AlertItem({
         <span className="font-mono text-xs text-muted">{timeLabel}</span>
       </div>
       <div className="mt-1 font-mono text-xs text-muted">
-        {alert.ip} · {alert.country}
+        {alert.ip}
+        {alert.country && ` · ${alert.country}`}
         {alert.ruleId && ` · ${alert.ruleId}`}
       </div>
 
-      {!terminated ? (
-        <button
-          onClick={handleClick}
-          className={`mt-2 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-            confirming
-              ? "bg-danger text-white hover:bg-danger/90"
-              : "bg-surface2 text-ink hover:bg-line"
-          }`}
-        >
-          {confirming ? "정말 세션을 종료할까요? (클릭하여 확정)" : "세션 강제 종료"}
-        </button>
-      ) : (
-        <div className="mt-2 text-xs text-normal">세션이 종료되었습니다.</div>
-      )}
+      <button
+        onClick={handleClick}
+        className={`mt-2 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
+          confirming
+            ? "bg-danger text-white hover:bg-danger/90"
+            : "bg-surface2 text-ink hover:bg-line"
+        }`}
+      >
+        {confirming
+          ? hasSession
+            ? "정말 세션을 종료할까요? (클릭하여 확정)"
+            : "정말 알림을 삭제할까요? (클릭하여 확정)"
+          : hasSession
+            ? "세션 강제 종료"
+            : "알림 삭제"}
+      </button>
     </div>
   );
 }
 
 export default function AlertList({
   alerts,
-  onTerminate,
+  onDismiss,
   reconnecting = false,
 }: {
   alerts: AlertEvent[];
-  onTerminate: (sessionId: string) => void;
+  onDismiss: (alert: AlertEvent) => void;
   /** true면 mock도 실시간 연결도 아닌, 연결 시도/재연결 중인 과도기 상태 */
   reconnecting?: boolean;
 }) {
@@ -115,7 +122,7 @@ export default function AlertList({
           </div>
         ) : (
           alerts.map((a) => (
-            <AlertItem key={a.id} alert={a} onTerminate={onTerminate} />
+            <AlertItem key={a.id} alert={a} onDismiss={onDismiss} />
           ))
         )}
       </div>
