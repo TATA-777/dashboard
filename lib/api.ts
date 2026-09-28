@@ -6,6 +6,9 @@
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 
+// next.config.js의 basePath. fetch에는 자동으로 안 붙으므로 대시보드 자체 라우트 호출 시 직접 붙인다.
+const BASE_PATH = "/dashboard";
+
 export type ApiProfile = "LOW" | "HIGH" | "ZERO_TRUST";
 
 interface TerminateSessionResult {
@@ -84,20 +87,18 @@ export async function fetchUserProfile(userId: string): Promise<ApiProfile> {
 // ⚠️ 위 apiFetch(오시은 인증서버, 외부 ALB)와 다르게, 이 3개는
 // 대시보드 "자기 자신"의 Next.js API 라우트를 호출함
 // (app/api/stats/*/route.ts — app/api/geo/[ip]와 동일한 패턴).
-// 브라우저 입장에서 같은 origin 요청이라 CORS/ALB 등록 문제 자체가
-// 없음. 상대경로로 fetch하는 이유가 그거라, BASE_URL을 안 씀.
+// 각 라우트가 서버사이드에서 오시은(login-trend/profile-dist)·
+// 서지영(rule-hits, Wazuh) API를 대신 호출하는 프록시 구조.
 //
-// 지금은 그 라우트들이 각각 mock 값을 반환하지만, 나중에 오시은
-// (login-trend/profile-dist)·서지영(rule-hits) 쪽 실제 데이터가
-// 준비되면 route.ts 안에서 서버사이드로 그 API를 fetch해서 전달하는
-// 프록시로 바꾸면 됨 — 이 파일의 fetchLoginTrend 등 함수 시그니처는
-// 그대로 유지되므로 useDashboardStats 훅은 손댈 필요 없음.
+// ⚠️ 9/28 수정: basePath('/dashboard')가 fetch에 자동으로 안 붙어서
+// '/api/stats/...'로 나가면 ALB가 인증서버로 보내버림 → 프록시를 안 거치고
+// 인증서버 응답을 받던 버그. 반드시 '/dashboard' 접두사를 붙여서 호출한다.
 // ─────────────────────────────────────────────
 
 async function statsFetch<T>(path: string): Promise<T> {
-  const res = await fetch(path);
+  const res = await fetch(`${BASE_PATH}${path}`, { cache: "no-store" });
   if (!res.ok) {
-    throw new Error(`통계 API 요청 실패 (${res.status}): ${path}`);
+    throw new Error(`통계 API 요청 실패 (${res.status}): ${BASE_PATH}${path}`);
   }
   return res.json() as Promise<T>;
 }
@@ -119,19 +120,19 @@ export interface ProfileDistPoint {
   count: number;
 }
 
-/** 시간대별 로그인 추이. GET /api/stats/login-trend (대시보드 자체 라우트) */
+/** 시간대별 로그인 추이. GET /dashboard/api/stats/login-trend (대시보드 자체 라우트) */
 export async function fetchLoginTrend(): Promise<LoginTrendPoint[]> {
   const data = await statsFetch<{ trend: LoginTrendPoint[] }>("/api/stats/login-trend");
   return data.trend;
 }
 
-/** 룰별 탐지 건수. GET /api/stats/rule-hits (대시보드 자체 라우트) */
+/** 룰별 탐지 건수. GET /dashboard/api/stats/rule-hits (대시보드 자체 라우트 → Wazuh) */
 export async function fetchRuleHits(): Promise<RuleHitPoint[]> {
   const data = await statsFetch<{ rules: RuleHitPoint[] }>("/api/stats/rule-hits");
   return data.rules;
 }
 
-/** 프로파일 분포. GET /api/stats/profile-dist (대시보드 자체 라우트) */
+/** 프로파일 분포. GET /dashboard/api/stats/profile-dist (대시보드 자체 라우트) */
 export async function fetchProfileDist(): Promise<ProfileDistPoint[]> {
   const data = await statsFetch<{ distribution: ProfileDistPoint[] }>("/api/stats/profile-dist");
   return data.distribution;
