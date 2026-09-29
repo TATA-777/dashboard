@@ -166,6 +166,11 @@ export function useLiveDashboard() {
   // 이미 실데이터 플래그가 true였다면(=예전에 이미 mock을 한 번 지운 적 있음) 다시 지울 필요 없음
   const hasClearedMock = useRef(hasRealDataFlag());
 
+  // (9/29) Wazuh(event:anomaly-detected)가 이상으로 판단한 IP → 룰 라벨.
+  // 인증서버(login:success)는 정상으로 보냈어도, 같은 IP를 Wazuh가 잡았으면 지도에서 빨간 점으로 표시하기 위함.
+  // (login:success가 Wazuh 이벤트보다 늦게 도착하는 경우까지 처리하려고 ref에 기억해 둠)
+  const anomalyIps = useRef<Map<string, string>>(new Map());
+
   // events/alerts가 바뀔 때마다 로컬스토리지에 계속 반영
   useEffect(() => {
     saveToStorage(EVENTS_STORAGE_KEY, events);
@@ -201,7 +206,12 @@ export function useLiveDashboard() {
     };
 
     const handleLoginNew = async (payload: LoginSuccessPayload) => {
-      const event = await buildLoginEvent(payload, payload.isAnomaly ? "alert" : "normal");
+      const built = await buildLoginEvent(payload, payload.isAnomaly ? "alert" : "normal");
+      // Wazuh가 먼저 이 IP를 이상으로 잡았으면 인증서버 판정과 상관없이 alert로 표시
+      const wazuhLabel = anomalyIps.current.get(built.ip);
+      const event: LoginEvent = wazuhLabel
+        ? { ...built, status: "alert", reason: built.reason ?? wazuhLabel }
+        : built;
       setEvents((prev) => [event, ...prev].slice(0, MAX_EVENTS));
     };
 
@@ -251,6 +261,17 @@ export function useLiveDashboard() {
           ...prev,
         ].slice(0, MAX_ALERTS)
       );
+
+      // 지도에 이미 찍힌 같은 IP의 점을 빨간색(alert)으로 변경
+      // (포트스캔처럼 로그인과 무관한 탐지는 지도에 같은 IP 점이 없어서 아무 변화 없음)
+      if (ip !== "-") {
+        anomalyIps.current.set(ip, ruleLabel);
+        setEvents((prev) =>
+          prev.map((e): LoginEvent =>
+            e.ip === ip ? { ...e, status: "alert", reason: e.reason ?? ruleLabel } : e
+          )
+        );
+      }
     };
 
     socket.on("connect", handleConnect);
