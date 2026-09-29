@@ -8,6 +8,9 @@ import { io, type Socket } from "socket.io-client";
 //   login:anomaly  — 이상 탐지   { userId, email, ipAddress, reason, trustLevel, timestamp }
 //   session:killed — 세션 종료(서버 → 클라이언트 브로드캐스트) { userId, sessionId, reason, timestamp }
 //
+// (9/30) GuardDuty 추가: event:security-alert — 수정 Lambda → Redis guardduty:finding → 시은 서버가 변환해서 전파
+//   { id, source: "GUARD_DUTY", title, severity, region, location: { ip, lat, lon, country, isInternal }, timestamp }
+//
 // ⚠️ 위 payload 어디에도 sessionId/좌표/국가가 없음 (session:killed만 sessionId 있음).
 //   sessionId는 GET /api/sessions?userId=로, 좌표는 geolocateIp()로 useLiveDashboard.ts에서 직접 채움.
 //
@@ -34,6 +37,7 @@ export const EVENTS = {
   ALERT_DETECTED: "login:anomaly",
   SESSION_TERMINATED: "session:killed", // 서버 → 클라이언트 (응답/브로드캐스트)
   ANOMALY_DETECTED: "event:anomaly-detected", // 지영 확정(9/23): Wazuh R-01~R-06 탐지 전체 (로그인 무관 인프라 공격 포함)
+  SECURITY_ALERT: "event:security-alert", // (9/30) GuardDuty Finding — 시은 서버가 guardduty:finding을 변환해서 전파
 } as const;
 
 let socketInstance: Socket | null = null;

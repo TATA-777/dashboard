@@ -19,6 +19,8 @@ const MAX_ALERTS = 1000; // 알림은 사실상 무제한 (관리자가 직접 �
 // (9/29) 지도 표시 원칙: 정상 로그인 1건 = 파란 점 1개, 이상 알림 1건 = 빨간 점 1개
 // Wazuh 알림(event:anomaly-detected) 1건마다 대시보드가 찍는 빨간 점의 id 접두사 (점 id = 접두사 + 알림 id)
 const WAZUH_DOT_PREFIX = "wazuh:";
+// (9/30) GuardDuty 알림(event:security-alert)의 알림 id 접두사. 빨간 점 id도 알림 id와 똑같이 씀 (점 id === 알림 id)
+const GUARDDUTY_ID_PREFIX = "guardduty-";
 // (9/29) Wazuh 탐지와 같은 IP의 로그인을 "같은 로그인"으로 보는 시간.
 // 이 시간 안의 같은 IP 파란 점은 Wazuh 빨간 점으로 교체하고, 이후 같은 IP로 정상 시간대에 로그인하면 다시 파란 점으로 찍힘.
 const ANOMALY_IP_TTL_MS = 60_000;
@@ -137,6 +139,37 @@ export interface AnomalyDetectedPayload {
   message?: string;
   wazuhRuleId?: string;
   source?: string;
+}
+
+/**
+ * (9/30) GuardDuty Finding 이벤트 (event:security-alert).
+ * 흐름: GuardDuty → EventBridge → Lambda(수정) → Redis guardduty:finding → 인증서버(시은)가 아래 형태로 변환해서 전파.
+ * ⚠️ severity는 실제 Finding이면 숫자(1~10), 테스트 PUBLISH면 "High" 같은 문자열로 올 수 있음.
+ * ⚠️ location은 lng가 아니라 lon. 좌표를 못 찾으면 서울 좌표 + isInternal: true로 폴백되므로 지도엔 안 찍음.
+ */
+export interface SecurityAlertPayload {
+  id?: string;
+  source?: string;
+  title?: string;
+  severity?: string | number;
+  region?: string;
+  location?: {
+    ip?: string;
+    lat?: number;
+    lon?: number;
+    country?: string;
+    isInternal?: boolean;
+  } | null;
+  timestamp?: string;
+}
+
+// (9/30) GuardDuty 심각도 → 알림 색상. 7 이상(High/Critical)만 빨강, 나머지는 주황
+function toGuardDutySeverity(severity: string | number | undefined): "high" | "medium" {
+  if (severity === undefined || severity === null || severity === "") return "medium";
+  const n = Number(severity);
+  if (!Number.isNaN(n)) return n >= 7 ? "high" : "medium";
+  const s = String(severity).toLowerCase();
+  return s === "high" || s === "critical" ? "high" : "medium";
 }
 
 async function buildLoginEvent(
@@ -334,12 +367,63 @@ export function useLiveDashboard() {
       );
     };
 
+    // (9/30) GuardDuty 알림(event:security-alert): 알림 1건 + 빨간 점 1개
+    // 점 id === 알림 id → handleDismiss의 기존 조건(e.id !== alert.id)으로 알림 삭제 시 점도 같이 지워짐
+    const handleSecurityAlert = (payload: SecurityAlertPayload) => {
+      const findingId = payload.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const alertId = `${GUARDDUTY_ID_PREFIX}${findingId}`;
+      const title = payload.title || "GuardDuty Security Finding";
+      const time = payload.timestamp || new Date().toISOString();
+      const loc = payload.location ?? undefined;
+      const ip = loc?.ip || "-";
+
+      setAlerts((prev) =>
+        [
+          {
+            id: alertId,
+            sessionId: "", // 세션 없음 → 버튼이 "알림 삭제"로 표시되고 세션 종료 요청도 안 나감
+            ruleLabel: `GuardDuty · ${title}`,
+            ip,
+            country: loc?.country ?? "",
+            time,
+            severity: toGuardDutySeverity(payload.severity),
+          },
+          ...prev.filter((a) => a.id !== alertId), // 같은 Finding이 다시 오면(GuardDuty 갱신) 중복 없이 교체
+        ].slice(0, MAX_ALERTS)
+      );
+
+      // AWS 내부 행위(외부 IP/좌표 없음 → 서울 좌표 폴백)는 가짜 위치라 지도엔 안 찍고 알림만 띄움
+      if (!loc || loc.isInternal) return;
+      const lat = loc.lat;
+      const lng = loc.lon; // ⚠️ 서버는 lng가 아니라 lon으로 보냄
+      if (typeof lat !== "number" || typeof lng !== "number" || !Number.isFinite(lat) || !Number.isFinite(lng)) return;
+      if (lat === 0 && lng === 0) return;
+
+      // 알림 1건 = 빨간 점 1개 (점 id === 알림 id)
+      const dot: LoginEvent = {
+        id: alertId,
+        sessionId: "",
+        userId: "GuardDuty",
+        ip,
+        lat,
+        lng,
+        country: loc.country ?? "",
+        city: "",
+        time,
+        profile: "-" as Profile, // GuardDuty 이벤트엔 프로파일 정보가 없어서 팝업에 "-"로 표시
+        status: "alert",
+        reason: payload.region ? `${title} (${payload.region})` : title,
+      };
+      setEvents((prev) => capEvents([dot, ...prev.filter((e) => e.id !== alertId)]));
+    };
+
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
     socket.on(EVENTS.LOGIN_NEW, handleLoginNew);
     socket.on(EVENTS.ALERT_DETECTED, handleAlertDetected);
     socket.on(EVENTS.SESSION_TERMINATED, handleSessionTerminated);
     socket.on(EVENTS.ANOMALY_DETECTED, handleAnomalyDetected);
+    socket.on(EVENTS.SECURITY_ALERT, handleSecurityAlert);
 
     return () => {
       socket.off("connect", handleConnect);
@@ -348,6 +432,7 @@ export function useLiveDashboard() {
       socket.off(EVENTS.ALERT_DETECTED, handleAlertDetected);
       socket.off(EVENTS.SESSION_TERMINATED, handleSessionTerminated);
       socket.off(EVENTS.ANOMALY_DETECTED, handleAnomalyDetected);
+      socket.off(EVENTS.SECURITY_ALERT, handleSecurityAlert);
     };
   }, []);
 
@@ -356,6 +441,7 @@ export function useLiveDashboard() {
    * - 알림 1건 = 빨간 점 1개이므로, 알림을 지우면 그 알림의 점 1개만 같이 지움
    *   · 로그인 이상탐지 알림: 점 id === 알림 id
    *   · Wazuh 알림: 점 id === "wazuh:" + 알림 id
+   *   · GuardDuty 알림(9/30): 점 id === 알림 id ("guardduty-" + Finding id)
    *   · mock 알림: 알림 id === "alert-" + 점 id
    * - 세션이 있는 알림(로그인 이상탐지)은 세션 강제 종료까지 수행
    */
