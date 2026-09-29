@@ -14,12 +14,13 @@ import {
 } from "@/mock/mockData";
 
 const FORCE_MOCK = process.env.NEXT_PUBLIC_FORCE_MOCK === "true";
-const MAX_EVENTS = 50; // 지도 점(events)용
+const MAX_EVENTS = 50; // 지도 파란 점(정상 로그인) 최대 개수 — 빨간 점은 알림과 1:1이라 알림을 지울 때만 사라짐
 const MAX_ALERTS = 1000; // 알림은 사실상 무제한 (관리자가 직접 지울 때만 삭제)
-// (9/29) Wazuh 탐지만 있고 로그인 이벤트가 없는 IP에 대시보드가 직접 찍는 점의 id 접두사
+// (9/29) 지도 표시 원칙: 정상 로그인 1건 = 파란 점 1개, 이상 알림 1건 = 빨간 점 1개
+// Wazuh 알림(event:anomaly-detected) 1건마다 대시보드가 찍는 빨간 점의 id 접두사 (점 id = 접두사 + 알림 id)
 const WAZUH_DOT_PREFIX = "wazuh:";
-// (9/29) Wazuh 탐지 IP를 기억하는 시간. Wazuh가 로그인 이벤트보다 먼저 도착하는 경우만 처리하면 되므로 짧게 둔다.
-// 이 시간이 지난 뒤 같은 IP로 정상 시간대에 로그인하면 다시 파란 점으로 찍힘.
+// (9/29) Wazuh 탐지와 같은 IP의 로그인을 "같은 로그인"으로 보는 시간.
+// 이 시간 안의 같은 IP 파란 점은 Wazuh 빨간 점으로 교체하고, 이후 같은 IP로 정상 시간대에 로그인하면 다시 파란 점으로 찍힘.
 const ANOMALY_IP_TTL_MS = 60_000;
 
 // 새로고침/dev 서버 재시작해도 실시간 알림이 안 사라지도록 로컬스토리지에 저장
@@ -81,18 +82,10 @@ function toRuleId(value: string): RuleId | undefined {
   return RULE_IDS.includes(value) ? (value as RuleId) : undefined;
 }
 
-// (9/29) 같은 로그인 1건인지 판별: 같은 IP이면서 (같은 세션이거나, 세션을 못 찾았으면 5초 이내 시각)
-// 인증서버는 이상 로그인 1건에 login:success(isAnomaly: true)와 login:anomaly를 따로 보내서
-// 같은 자리에 점이 2개 겹쳐 찍히던 문제를 막는 데 사용한다.
-const SAME_LOGIN_WINDOW_MS = 5_000;
-function isSameLogin(
-  a: { ip: string; sessionId: string; time: string },
-  b: { ip: string; sessionId: string; time: string }
-): boolean {
-  if (a.ip !== b.ip) return false;
-  if (a.sessionId && b.sessionId) return a.sessionId === b.sessionId;
-  const gap = Math.abs(new Date(a.time).getTime() - new Date(b.time).getTime());
-  return gap < SAME_LOGIN_WINDOW_MS;
+// (9/29) 지도 점 개수 제한: 파란 점(정상)만 최신 MAX_EVENTS개로 자르고, 빨간 점(이상)은 알림과 1:1이라 전부 유지
+function capEvents(list: LoginEvent[]): LoginEvent[] {
+  let normalCount = 0;
+  return list.filter((e) => e.status !== "normal" || ++normalCount <= MAX_EVENTS);
 }
 
 function toProfile(trustLevel: string): Profile {
@@ -199,10 +192,9 @@ export function useLiveDashboard() {
   // 이미 실데이터 플래그가 true였다면(=예전에 이미 mock을 한 번 지운 적 있음) 다시 지울 필요 없음
   const hasClearedMock = useRef(hasRealDataFlag());
 
-  // (9/29) Wazuh(event:anomaly-detected)가 이상으로 판단한 IP → 룰 라벨.
-  // 인증서버(login:success)는 정상으로 보냈어도, 같은 IP를 Wazuh가 잡았으면 지도에서 빨간 점으로 표시하기 위함.
-  // (login:success가 Wazuh 이벤트보다 늦게 도착하는 경우까지 처리하려고 ref에 기억해 둠)
-  const anomalyIps = useRef<Map<string, { label: string; ruleId?: RuleId; at: number }>>(new Map());
+  // (9/29) Wazuh(event:anomaly-detected)가 최근에 탐지한 IP → 탐지 시각(ms).
+  // login:success가 Wazuh 이벤트보다 늦게 도착하면, 그 로그인은 이미 Wazuh 빨간 점으로 표시돼 있으므로 파란 점을 따로 안 찍기 위함.
+  const anomalyIps = useRef<Map<string, number>>(new Map());
 
   // events/alerts가 바뀔 때마다 로컬스토리지에 계속 반영
   useEffect(() => {
@@ -239,43 +231,26 @@ export function useLiveDashboard() {
     };
 
     const handleLoginNew = async (payload: LoginSuccessPayload) => {
-      const built = await buildLoginEvent(payload, payload.isAnomaly ? "alert" : "normal");
-      // Wazuh가 먼저 이 IP를 이상으로 잡았으면 인증서버 판정과 상관없이 alert로 표시
-      // 최근(ANOMALY_IP_TTL_MS 이내)에 Wazuh가 잡은 IP일 때만 alert로 표시 → 오래된 탐지 때문에 정상 로그인이 빨개지지 않게
-      const hit = anomalyIps.current.get(built.ip);
-      const wazuh = hit && Date.now() - hit.at < ANOMALY_IP_TTL_MS ? hit : undefined;
-      if (hit && !wazuh) anomalyIps.current.delete(built.ip);
-      const event: LoginEvent = wazuh
-        ? {
-            ...built,
-            status: "alert",
-            ruleId: wazuh.ruleId ?? built.ruleId,
-            reason: built.reason ?? wazuh.label,
-          }
-        : built;
-      setEvents((prev) => {
-        // Wazuh가 먼저 와서 대시보드가 임시로 찍어둔 점(wazuh:)이 같은 IP에 있으면 실제 로그인 점으로 교체
-        const rest = prev.filter((e) => !(e.id.startsWith(WAZUH_DOT_PREFIX) && e.ip === event.ip));
-        // (9/29) 인증서버는 이상 로그인 1건에 login:success(isAnomaly: true)와 login:anomaly를 둘 다 보냄
-        // → login:anomaly 쪽 점이 이미 있으면(같은 로그인) 중복으로 안 찍음
-        if (rest.some((e) => !e.id.startsWith(WAZUH_DOT_PREFIX) && isSameLogin(e, event))) {
-          return rest;
-        }
-        return [event, ...rest].slice(0, MAX_EVENTS);
-      });
+      // (9/29) 이상 로그인은 인증서버가 login:anomaly를 따로 보내고, 그쪽에서 알림 1건 + 빨간 점 1개를 찍음
+      // → 여기서도 찍으면 같은 자리에 점이 2개 겹치므로 건너뜀
+      if (payload.isAnomaly) return;
+
+      const event = await buildLoginEvent(payload, "normal");
+
+      // Wazuh가 최근(ANOMALY_IP_TTL_MS 이내)에 이 IP를 먼저 탐지했으면 이미 빨간 점으로 표시돼 있으므로 파란 점을 안 찍음
+      const detectedAt = anomalyIps.current.get(event.ip);
+      if (detectedAt !== undefined) {
+        if (Date.now() - detectedAt < ANOMALY_IP_TTL_MS) return;
+        anomalyIps.current.delete(event.ip);
+      }
+
+      setEvents((prev) => capEvents([event, ...prev.filter((e) => e.id !== event.id)]));
     };
 
     const handleAlertDetected = async (payload: LoginAnomalyPayload) => {
       const event = await buildLoginEvent(payload, "alert");
-      // (9/29) 같은 로그인으로 먼저 찍힌 login:success 점은 이 점으로 교체 → 점 1개만 남김
-      setEvents((prev) =>
-        [
-          event,
-          ...prev.filter(
-            (e) => e.id !== event.id && (e.id.startsWith(WAZUH_DOT_PREFIX) || !isSameLogin(e, event))
-          ),
-        ].slice(0, MAX_EVENTS)
-      );
+      // 알림 1건 = 빨간 점 1개 (알림 id와 점 id가 같음)
+      setEvents((prev) => capEvents([event, ...prev.filter((e) => e.id !== event.id)]));
       setAlerts((prev) =>
         [
           {
@@ -287,7 +262,7 @@ export function useLiveDashboard() {
             time: event.time,
             severity: "high" as const,
           },
-          ...prev,
+          ...prev.filter((a) => a.id !== event.id),
         ].slice(0, MAX_ALERTS)
       );
     };
@@ -313,7 +288,7 @@ export function useLiveDashboard() {
           {
             id: alertId,
             sessionId: "",
-            ruleId, // (9/29) 알림 삭제 시 지도에서 같은 IP·같은 룰로 빨개진 점을 찾기 위해 저장
+            ruleId,
             ruleLabel,
             ip,
             country: payload.country ?? "",
@@ -324,26 +299,14 @@ export function useLiveDashboard() {
         ].slice(0, MAX_ALERTS)
       );
 
+      // 사설 IP(10.x 등)나 IP가 없는 탐지는 위치 조회가 안 되므로 알림만 띄우고 지도엔 안 찍음
       if (ip === "-") return;
-      anomalyIps.current.set(ip, { label: ruleLabel, ruleId, at: Date.now() });
+      anomalyIps.current.set(ip, Date.now());
 
-      // ① 같은 IP로 "최근(ANOMALY_IP_TTL_MS 이내)"에 찍힌 점 중 가장 최근 것 하나만 빨간색(alert)으로 변경
-      //    (예전 정상 시간대에 찍힌 같은 IP의 파란 점까지 빨개지지 않게, events는 최신순이라 첫 번째가 가장 최근)
-      const isRecentSameIp = (e: LoginEvent) =>
-        e.ip === ip && Date.now() - new Date(e.time).getTime() < ANOMALY_IP_TTL_MS;
-      setEvents((prev) => {
-        const idx = prev.findIndex(isRecentSameIp);
-        if (idx === -1) return prev;
-        const next = [...prev];
-        const e = next[idx];
-        next[idx] = { ...e, status: "alert", ruleId: ruleId ?? e.ruleId, reason: e.reason ?? ruleLabel };
-        return next;
-      });
-
-      // ② (9/29) 최근 같은 IP 점이 없으면(로그인 이벤트가 안 왔거나 아직 도착 전) 위치를 조회해서 빨간 점을 직접 찍음
-      //    사설 IP(10.x 등)는 위치 조회가 실패해서 (0,0)이 나오므로 지도에 안 찍음
       const geo = await geolocateIp(ip);
       if (geo.lat === 0 && geo.lng === 0) return;
+
+      // 알림 1건 = 빨간 점 1개 (점 id = "wazuh:" + 알림 id)
       const dot: LoginEvent = {
         id: `${WAZUH_DOT_PREFIX}${alertId}`,
         sessionId: "",
@@ -359,9 +322,15 @@ export function useLiveDashboard() {
         ruleId,
         reason: ruleLabel,
       };
-      // 최근 로그인 점이 이미 있으면(①에서 빨개짐) 중복으로 안 찍음
+
+      // 같은 IP로 최근(ANOMALY_IP_TTL_MS 이내)에 찍힌 파란 점은 같은 로그인이므로 이 빨간 점으로 교체
+      // (인증서버는 정상, Wazuh는 이상으로 본 로그인 → 빨간 점 1개로만 표시)
+      const isRecentNormalSameIp = (e: LoginEvent) =>
+        e.status === "normal" &&
+        e.ip === ip &&
+        Date.now() - new Date(e.time).getTime() < ANOMALY_IP_TTL_MS;
       setEvents((prev) =>
-        prev.some(isRecentSameIp) ? prev : [dot, ...prev].slice(0, MAX_EVENTS)
+        capEvents([dot, ...prev.filter((e) => !isRecentNormalSameIp(e))])
       );
     };
 
@@ -384,33 +353,25 @@ export function useLiveDashboard() {
 
   /**
    * 알림 삭제 (9/28 수정, 9/29 수정)
-   * - 알림은 무조건 id 기준으로 삭제 → Wazuh 알림(sessionId 없음)도 정상 삭제됨
-   * - 지도 점 삭제 기준 (하나라도 해당하면 삭제)
-   *   ① 알림과 같은 id의 점 (mock은 알림 id가 "alert-" + 점 id)
-   *   ② 로그인 이상탐지 알림: 같은 로그인의 점 (같은 IP + 같은 세션, 세션이 없으면 5초 이내 시각)
-   *      → login:success로 따로 찍힌 점까지 같이 삭제, 다른 IP 점은 안 지워짐
-   *   ③ Wazuh 알림: 같은 IP + 같은 룰로 빨개진 점 (대시보드가 직접 찍은 wazuh: 점 포함)
-   * - 세션이 있는 알림은 세션 강제 종료까지 수행
+   * - 알림 1건 = 빨간 점 1개이므로, 알림을 지우면 그 알림의 점 1개만 같이 지움
+   *   · 로그인 이상탐지 알림: 점 id === 알림 id
+   *   · Wazuh 알림: 점 id === "wazuh:" + 알림 id
+   *   · mock 알림: 알림 id === "alert-" + 점 id
+   * - 세션이 있는 알림(로그인 이상탐지)은 세션 강제 종료까지 수행
    */
   const handleDismiss = useCallback(
     async (alert: AlertEvent) => {
       setAlerts((prev) => prev.filter((a) => a.id !== alert.id));
-
       setEvents((prev) =>
-        prev.filter((e) => {
-          if (e.id === alert.id || `alert-${e.id}` === alert.id) return false;
-          if (!alert.ruleId && !e.id.startsWith(WAZUH_DOT_PREFIX) && isSameLogin(e, alert)) return false;
-          if (!alert.sessionId && alert.ruleId && e.ip === alert.ip && e.ruleId === alert.ruleId) {
-            return false;
-          }
-          return true;
-        })
+        prev.filter(
+          (e) =>
+            e.id !== alert.id &&
+            e.id !== `${WAZUH_DOT_PREFIX}${alert.id}` &&
+            `alert-${e.id}` !== alert.id
+        )
       );
 
-      if (!alert.sessionId) {
-        if (alert.ruleId) anomalyIps.current.delete(alert.ip);
-        return;
-      }
+      if (!alert.sessionId) return;
 
       // mock 알림(가짜 sessionId: sess-900x)은 서버에 세션 종료 요청을 보내지 않음
       if (usingMock || isMock(alert.id)) return;
