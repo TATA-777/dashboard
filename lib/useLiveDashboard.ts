@@ -18,6 +18,9 @@ const MAX_EVENTS = 50; // 지도 점(events)용
 const MAX_ALERTS = 1000; // 알림은 사실상 무제한 (관리자가 직접 지울 때만 삭제)
 // (9/30) Wazuh 탐지만 있고 로그인 이벤트가 없는 IP에 대시보드가 직접 찍는 점의 id 접두사
 const WAZUH_DOT_PREFIX = "wazuh:";
+// (9/30) Wazuh 탐지 IP를 기억하는 시간. Wazuh가 로그인 이벤트보다 먼저 도착하는 경우만 처리하면 되므로 짧게 둔다.
+// 이 시간이 지난 뒤 같은 IP로 정상 시간대에 로그인하면 다시 파란 점으로 찍힘.
+const ANOMALY_IP_TTL_MS = 60_000;
 
 // 새로고침/dev 서버 재시작해도 실시간 알림이 안 사라지도록 로컬스토리지에 저장
 const EVENTS_STORAGE_KEY = "zw-dashboard-events";
@@ -185,7 +188,7 @@ export function useLiveDashboard() {
   // (9/29) Wazuh(event:anomaly-detected)가 이상으로 판단한 IP → 룰 라벨.
   // 인증서버(login:success)는 정상으로 보냈어도, 같은 IP를 Wazuh가 잡았으면 지도에서 빨간 점으로 표시하기 위함.
   // (login:success가 Wazuh 이벤트보다 늦게 도착하는 경우까지 처리하려고 ref에 기억해 둠)
-  const anomalyIps = useRef<Map<string, { label: string; ruleId?: RuleId }>>(new Map());
+  const anomalyIps = useRef<Map<string, { label: string; ruleId?: RuleId; at: number }>>(new Map());
 
   // events/alerts가 바뀔 때마다 로컬스토리지에 계속 반영
   useEffect(() => {
@@ -224,7 +227,10 @@ export function useLiveDashboard() {
     const handleLoginNew = async (payload: LoginSuccessPayload) => {
       const built = await buildLoginEvent(payload, payload.isAnomaly ? "alert" : "normal");
       // Wazuh가 먼저 이 IP를 이상으로 잡았으면 인증서버 판정과 상관없이 alert로 표시
-      const wazuh = anomalyIps.current.get(built.ip);
+      // 최근(ANOMALY_IP_TTL_MS 이내)에 Wazuh가 잡은 IP일 때만 alert로 표시 → 오래된 탐지 때문에 정상 로그인이 빨개지지 않게
+      const hit = anomalyIps.current.get(built.ip);
+      const wazuh = hit && Date.now() - hit.at < ANOMALY_IP_TTL_MS ? hit : undefined;
+      if (hit && !wazuh) anomalyIps.current.delete(built.ip);
       const event: LoginEvent = wazuh
         ? {
             ...built,
@@ -294,18 +300,22 @@ export function useLiveDashboard() {
       );
 
       if (ip === "-") return;
-      anomalyIps.current.set(ip, { label: ruleLabel, ruleId });
+      anomalyIps.current.set(ip, { label: ruleLabel, ruleId, at: Date.now() });
 
-      // ① 지도에 이미 찍힌 같은 IP의 점이 있으면 바로 빨간색(alert)으로 변경
-      setEvents((prev) =>
-        prev.map((e): LoginEvent =>
-          e.ip === ip
-            ? { ...e, status: "alert", ruleId: ruleId ?? e.ruleId, reason: e.reason ?? ruleLabel }
-            : e
-        )
-      );
+      // ① 같은 IP로 "최근(ANOMALY_IP_TTL_MS 이내)"에 찍힌 점 중 가장 최근 것 하나만 빨간색(alert)으로 변경
+      //    (예전 정상 시간대에 찍힌 같은 IP의 파란 점까지 빨개지지 않게, events는 최신순이라 첫 번째가 가장 최근)
+      const isRecentSameIp = (e: LoginEvent) =>
+        e.ip === ip && Date.now() - new Date(e.time).getTime() < ANOMALY_IP_TTL_MS;
+      setEvents((prev) => {
+        const idx = prev.findIndex(isRecentSameIp);
+        if (idx === -1) return prev;
+        const next = [...prev];
+        const e = next[idx];
+        next[idx] = { ...e, status: "alert", ruleId: ruleId ?? e.ruleId, reason: e.reason ?? ruleLabel };
+        return next;
+      });
 
-      // ② (9/30) 같은 IP 점이 없으면(로그인 이벤트가 안 왔거나 아직 도착 전) 위치를 조회해서 빨간 점을 직접 찍음
+      // ② (9/30) 최근 같은 IP 점이 없으면(로그인 이벤트가 안 왔거나 아직 도착 전) 위치를 조회해서 빨간 점을 직접 찍음
       //    사설 IP(10.x 등)는 위치 조회가 실패해서 (0,0)이 나오므로 지도에 안 찍음
       const geo = await geolocateIp(ip);
       if (geo.lat === 0 && geo.lng === 0) return;
@@ -324,9 +334,9 @@ export function useLiveDashboard() {
         ruleId,
         reason: ruleLabel,
       };
-      // 위치 조회하는 사이에 로그인 점이 먼저 찍혔으면(①에서 이미 빨개짐) 중복으로 안 찍음
+      // 최근 로그인 점이 이미 있으면(①에서 빨개짐) 중복으로 안 찍음
       setEvents((prev) =>
-        prev.some((e) => e.ip === ip) ? prev : [dot, ...prev].slice(0, MAX_EVENTS)
+        prev.some(isRecentSameIp) ? prev : [dot, ...prev].slice(0, MAX_EVENTS)
       );
     };
 
