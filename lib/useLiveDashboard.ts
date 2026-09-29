@@ -16,6 +16,8 @@ import {
 const FORCE_MOCK = process.env.NEXT_PUBLIC_FORCE_MOCK === "true";
 const MAX_EVENTS = 50; // 지도 점(events)용
 const MAX_ALERTS = 1000; // 알림은 사실상 무제한 (관리자가 직접 지울 때만 삭제)
+// (9/30) Wazuh 탐지만 있고 로그인 이벤트가 없는 IP에 대시보드가 직접 찍는 점의 id 접두사
+const WAZUH_DOT_PREFIX = "wazuh:";
 
 // 새로고침/dev 서버 재시작해도 실시간 알림이 안 사라지도록 로컬스토리지에 저장
 const EVENTS_STORAGE_KEY = "zw-dashboard-events";
@@ -231,7 +233,13 @@ export function useLiveDashboard() {
             reason: built.reason ?? wazuh.label,
           }
         : built;
-      setEvents((prev) => [event, ...prev].slice(0, MAX_EVENTS));
+      // Wazuh가 먼저 와서 대시보드가 임시로 찍어둔 점(wazuh:)이 같은 IP에 있으면 실제 로그인 점으로 교체
+      setEvents((prev) =>
+        [
+          event,
+          ...prev.filter((e) => !(e.id.startsWith(WAZUH_DOT_PREFIX) && e.ip === event.ip)),
+        ].slice(0, MAX_EVENTS)
+      );
     };
 
     const handleAlertDetected = async (payload: LoginAnomalyPayload) => {
@@ -261,40 +269,65 @@ export function useLiveDashboard() {
       setAlerts((prev) => prev.filter((a) => a.sessionId !== payload.sessionId));
     };
 
-    const handleAnomalyDetected = (payload: AnomalyDetectedPayload) => {
+    const handleAnomalyDetected = async (payload: AnomalyDetectedPayload) => {
       const ip = payload.ip ?? payload.srcIp ?? "-";
       const ruleLabel = payload.ruleName ? `${payload.ruleId} · ${payload.ruleName}` : payload.ruleId;
       const ruleId = toRuleId(payload.ruleId);
       // timestamp가 안 올 수도 있어서 id는 절대 겹치지 않도록 별도 조합
       const uniqueSuffix = `${payload.timestamp ?? Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const alertId = `${payload.ruleId}-${uniqueSuffix}`;
+      const time = payload.timestamp ?? new Date().toISOString();
       setAlerts((prev) =>
         [
           {
-            id: `${payload.ruleId}-${uniqueSuffix}`,
+            id: alertId,
             sessionId: "",
             ruleId, // (9/30) 알림 삭제 시 지도에서 같은 IP·같은 룰로 빨개진 점을 찾기 위해 저장
             ruleLabel,
             ip,
             country: payload.country ?? "",
-            time: payload.timestamp ?? new Date().toISOString(),
+            time,
             severity: "high" as const,
           },
           ...prev,
         ].slice(0, MAX_ALERTS)
       );
 
-      // 지도에 이미 찍힌 같은 IP의 점을 빨간색(alert)으로 변경
-      // (포트스캔처럼 로그인과 무관한 탐지는 지도에 같은 IP 점이 없어서 아무 변화 없음)
-      if (ip !== "-") {
-        anomalyIps.current.set(ip, { label: ruleLabel, ruleId });
-        setEvents((prev) =>
-          prev.map((e): LoginEvent =>
-            e.ip === ip
-              ? { ...e, status: "alert", ruleId: ruleId ?? e.ruleId, reason: e.reason ?? ruleLabel }
-              : e
-          )
-        );
-      }
+      if (ip === "-") return;
+      anomalyIps.current.set(ip, { label: ruleLabel, ruleId });
+
+      // ① 지도에 이미 찍힌 같은 IP의 점이 있으면 바로 빨간색(alert)으로 변경
+      setEvents((prev) =>
+        prev.map((e): LoginEvent =>
+          e.ip === ip
+            ? { ...e, status: "alert", ruleId: ruleId ?? e.ruleId, reason: e.reason ?? ruleLabel }
+            : e
+        )
+      );
+
+      // ② (9/30) 같은 IP 점이 없으면(로그인 이벤트가 안 왔거나 아직 도착 전) 위치를 조회해서 빨간 점을 직접 찍음
+      //    사설 IP(10.x 등)는 위치 조회가 실패해서 (0,0)이 나오므로 지도에 안 찍음
+      const geo = await geolocateIp(ip);
+      if (geo.lat === 0 && geo.lng === 0) return;
+      const dot: LoginEvent = {
+        id: `${WAZUH_DOT_PREFIX}${alertId}`,
+        sessionId: "",
+        userId: payload.userEmail ?? payload.userId ?? "unknown",
+        ip,
+        lat: geo.lat,
+        lng: geo.lng,
+        country: payload.country ?? geo.country,
+        city: geo.city,
+        time,
+        profile: "-" as Profile, // Wazuh 이벤트엔 프로파일 정보가 없어서 팝업에 "-"로 표시
+        status: "alert",
+        ruleId,
+        reason: ruleLabel,
+      };
+      // 위치 조회하는 사이에 로그인 점이 먼저 찍혔으면(①에서 이미 빨개짐) 중복으로 안 찍음
+      setEvents((prev) =>
+        prev.some((e) => e.ip === ip) ? prev : [dot, ...prev].slice(0, MAX_EVENTS)
+      );
     };
 
     socket.on("connect", handleConnect);
@@ -317,7 +350,7 @@ export function useLiveDashboard() {
   /**
    * 알림 삭제 (9/28 수정, 9/30 수정)
    * - 알림은 무조건 id 기준으로 삭제 → Wazuh 알림(sessionId 없음)도 정상 삭제됨
-   * - Wazuh 알림: 같은 IP + 같은 룰로 빨개진 지도 점도 같이 삭제 (예전엔 점이 남던 버그)
+   * - Wazuh 알림: 같은 IP + 같은 룰로 빨개진 지도 점(대시보드가 직접 찍은 wazuh: 점 포함)도 같이 삭제
    * - 로그인 이상탐지 알림: 알림과 같은 id의 지도 점만 삭제 (예전엔 sessionId로 지워서
    *   같은 세션으로 묶인 다른 IP 점까지 같이 사라지던 버그) + 세션 강제 종료 수행
    */
