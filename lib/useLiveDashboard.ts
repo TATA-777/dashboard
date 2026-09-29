@@ -61,6 +61,14 @@ function setRealDataFlag() {
   }
 }
 
+// ⚠️ 추가(9/29): mock 데이터 id인지 판별 (mockData.ts의 evt-1~3, alert-evt-1~3)
+// 소켓 연결 전 화면에 뜬 mock이 localStorage에 저장된 채로 실데이터 플래그가 켜지면
+// 옛날 mock이 "2일 전" 실데이터처럼 계속 남는 버그가 있었음 → 불러올 때 mock id만 걸러낸다.
+// 실데이터 id는 `${userId}-${timestamp}` / `${ruleId}-...` 형식이라 evt-로 시작하지 않음.
+function isMock(id: string): boolean {
+  return id.startsWith("evt-") || id.startsWith("alert-evt-");
+}
+
 function toProfile(trustLevel: string): Profile {
   if (trustLevel === "HIGH") return "High";
   if (trustLevel === "ZERO_TRUST") return "Zero-Trust";
@@ -141,11 +149,16 @@ export function useLiveDashboard() {
   // 실데이터 플래그가 true일 때만 로컬스토리지 값을 신뢰해서 불러오고,
   // 아니면(=한 번도 소켓에서 실데이터를 받아 mock을 지운 적 없으면) mock으로 시작
   // 플래그가 true인데 저장값이 없으면 mock이 아니라 빈 배열로 시작
+  // (9/29) 저장값을 불러올 때 mock id는 걸러냄 → 관리자가 안 지운 실데이터 알림은 그대로 유지
   const [events, setEvents] = useState<LoginEvent[]>(() =>
-    hasRealDataFlag() ? loadFromStorage<LoginEvent[]>(EVENTS_STORAGE_KEY, []) : mockLoginEvents
+    hasRealDataFlag()
+      ? loadFromStorage<LoginEvent[]>(EVENTS_STORAGE_KEY, []).filter((e) => !isMock(e.id))
+      : mockLoginEvents
   );
   const [alerts, setAlerts] = useState<AlertEvent[]>(() =>
-    hasRealDataFlag() ? loadFromStorage<AlertEvent[]>(ALERTS_STORAGE_KEY, []) : mockAlerts
+    hasRealDataFlag()
+      ? loadFromStorage<AlertEvent[]>(ALERTS_STORAGE_KEY, []).filter((a) => !isMock(a.id))
+      : mockAlerts
   );
   const [connected, setConnected] = useState(false);
   const [usingMock, setUsingMock] = useState(true);
@@ -270,7 +283,8 @@ export function useLiveDashboard() {
 
       setEvents((prev) => prev.filter((e) => e.sessionId !== alert.sessionId));
 
-      if (usingMock) return;
+      // mock 알림(가짜 sessionId: sess-900x)은 서버에 세션 종료 요청을 보내지 않음
+      if (usingMock || isMock(alert.id)) return;
 
       try {
         await terminateSession(alert.sessionId, "대시보드 관리자 강제 종료");
