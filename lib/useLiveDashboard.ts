@@ -10,6 +10,7 @@ import {
   type LoginEvent,
   type AlertEvent,
   type Profile,
+  type RuleId,
 } from "@/mock/mockData";
 
 const FORCE_MOCK = process.env.NEXT_PUBLIC_FORCE_MOCK === "true";
@@ -67,6 +68,12 @@ function setRealDataFlag() {
 // 실데이터 id는 `${userId}-${timestamp}` / `${ruleId}-...` 형식이라 evt-로 시작하지 않음.
 function isMock(id: string): boolean {
   return id.startsWith("evt-") || id.startsWith("alert-evt-");
+}
+
+// (9/30) Wazuh payload의 ruleId 문자열이 R-01~R-06 중 하나일 때만 RuleId로 인정
+const RULE_IDS: readonly string[] = ["R-01", "R-02", "R-03", "R-04", "R-05", "R-06"];
+function toRuleId(value: string): RuleId | undefined {
+  return RULE_IDS.includes(value) ? (value as RuleId) : undefined;
 }
 
 function toProfile(trustLevel: string): Profile {
@@ -128,7 +135,14 @@ async function buildLoginEvent(
     geolocateIp(payload.ipAddress),
     fetchActiveSessions(payload.userId).catch(() => []),
   ]);
-  const latestSession = sessions[sessions.length - 1];
+  // ⚠️ 수정(9/30): 예전엔 그 유저의 "마지막 세션"을 무조건 가져와서, 같은 계정으로 여러 IP에서 로그인하면
+  // 서로 다른 점이 같은 sessionId를 갖게 됨 → 한 알림을 지우면 다른 IP 점까지 같이 사라지던 버그.
+  // 이제는 로그인 IP와 같은 세션 중 가장 최근 것을 고르고, 없을 때만 마지막 세션으로 대체한다.
+  const sameIp = sessions.filter((s) => s.ipAddress === payload.ipAddress);
+  const pool = sameIp.length > 0 ? sameIp : sessions;
+  const latestSession = [...pool].sort(
+    (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+  )[pool.length - 1];
   return {
     id: `${payload.userId}-${payload.timestamp}`,
     sessionId: latestSession?.sessionId ?? "",
@@ -169,7 +183,7 @@ export function useLiveDashboard() {
   // (9/29) Wazuh(event:anomaly-detected)가 이상으로 판단한 IP → 룰 라벨.
   // 인증서버(login:success)는 정상으로 보냈어도, 같은 IP를 Wazuh가 잡았으면 지도에서 빨간 점으로 표시하기 위함.
   // (login:success가 Wazuh 이벤트보다 늦게 도착하는 경우까지 처리하려고 ref에 기억해 둠)
-  const anomalyIps = useRef<Map<string, string>>(new Map());
+  const anomalyIps = useRef<Map<string, { label: string; ruleId?: RuleId }>>(new Map());
 
   // events/alerts가 바뀔 때마다 로컬스토리지에 계속 반영
   useEffect(() => {
@@ -208,9 +222,14 @@ export function useLiveDashboard() {
     const handleLoginNew = async (payload: LoginSuccessPayload) => {
       const built = await buildLoginEvent(payload, payload.isAnomaly ? "alert" : "normal");
       // Wazuh가 먼저 이 IP를 이상으로 잡았으면 인증서버 판정과 상관없이 alert로 표시
-      const wazuhLabel = anomalyIps.current.get(built.ip);
-      const event: LoginEvent = wazuhLabel
-        ? { ...built, status: "alert", reason: built.reason ?? wazuhLabel }
+      const wazuh = anomalyIps.current.get(built.ip);
+      const event: LoginEvent = wazuh
+        ? {
+            ...built,
+            status: "alert",
+            ruleId: wazuh.ruleId ?? built.ruleId,
+            reason: built.reason ?? wazuh.label,
+          }
         : built;
       setEvents((prev) => [event, ...prev].slice(0, MAX_EVENTS));
     };
@@ -245,6 +264,7 @@ export function useLiveDashboard() {
     const handleAnomalyDetected = (payload: AnomalyDetectedPayload) => {
       const ip = payload.ip ?? payload.srcIp ?? "-";
       const ruleLabel = payload.ruleName ? `${payload.ruleId} · ${payload.ruleName}` : payload.ruleId;
+      const ruleId = toRuleId(payload.ruleId);
       // timestamp가 안 올 수도 있어서 id는 절대 겹치지 않도록 별도 조합
       const uniqueSuffix = `${payload.timestamp ?? Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       setAlerts((prev) =>
@@ -252,6 +272,7 @@ export function useLiveDashboard() {
           {
             id: `${payload.ruleId}-${uniqueSuffix}`,
             sessionId: "",
+            ruleId, // (9/30) 알림 삭제 시 지도에서 같은 IP·같은 룰로 빨개진 점을 찾기 위해 저장
             ruleLabel,
             ip,
             country: payload.country ?? "",
@@ -265,10 +286,12 @@ export function useLiveDashboard() {
       // 지도에 이미 찍힌 같은 IP의 점을 빨간색(alert)으로 변경
       // (포트스캔처럼 로그인과 무관한 탐지는 지도에 같은 IP 점이 없어서 아무 변화 없음)
       if (ip !== "-") {
-        anomalyIps.current.set(ip, ruleLabel);
+        anomalyIps.current.set(ip, { label: ruleLabel, ruleId });
         setEvents((prev) =>
           prev.map((e): LoginEvent =>
-            e.ip === ip ? { ...e, status: "alert", reason: e.reason ?? ruleLabel } : e
+            e.ip === ip
+              ? { ...e, status: "alert", ruleId: ruleId ?? e.ruleId, reason: e.reason ?? ruleLabel }
+              : e
           )
         );
       }
@@ -292,17 +315,30 @@ export function useLiveDashboard() {
   }, []);
 
   /**
-   * 알림 삭제 (9/28 수정)
+   * 알림 삭제 (9/28 수정, 9/30 수정)
    * - 알림은 무조건 id 기준으로 삭제 → Wazuh 알림(sessionId 없음)도 정상 삭제됨
-   * - sessionId가 있는 알림(로그인 이상탐지)은 세션 강제 종료까지 수행
+   * - Wazuh 알림: 같은 IP + 같은 룰로 빨개진 지도 점도 같이 삭제 (예전엔 점이 남던 버그)
+   * - 로그인 이상탐지 알림: 알림과 같은 id의 지도 점만 삭제 (예전엔 sessionId로 지워서
+   *   같은 세션으로 묶인 다른 IP 점까지 같이 사라지던 버그) + 세션 강제 종료 수행
    */
   const handleDismiss = useCallback(
     async (alert: AlertEvent) => {
       setAlerts((prev) => prev.filter((a) => a.id !== alert.id));
 
-      if (!alert.sessionId) return;
+      if (!alert.sessionId) {
+        if (alert.ruleId && alert.ip !== "-") {
+          setEvents((prev) =>
+            prev.filter((e) => !(e.ip === alert.ip && e.ruleId === alert.ruleId))
+          );
+          anomalyIps.current.delete(alert.ip);
+        }
+        return;
+      }
 
-      setEvents((prev) => prev.filter((e) => e.sessionId !== alert.sessionId));
+      // 실데이터: 알림 id === 지도 점 id / mock: 알림 id === "alert-" + 지도 점 id
+      setEvents((prev) =>
+        prev.filter((e) => e.id !== alert.id && `alert-${e.id}` !== alert.id)
+      );
 
       // mock 알림(가짜 sessionId: sess-900x)은 서버에 세션 종료 요청을 보내지 않음
       if (usingMock || isMock(alert.id)) return;
