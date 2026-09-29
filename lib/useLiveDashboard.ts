@@ -16,9 +16,9 @@ import {
 const FORCE_MOCK = process.env.NEXT_PUBLIC_FORCE_MOCK === "true";
 const MAX_EVENTS = 50; // 지도 점(events)용
 const MAX_ALERTS = 1000; // 알림은 사실상 무제한 (관리자가 직접 지울 때만 삭제)
-// (9/30) Wazuh 탐지만 있고 로그인 이벤트가 없는 IP에 대시보드가 직접 찍는 점의 id 접두사
+// (9/29) Wazuh 탐지만 있고 로그인 이벤트가 없는 IP에 대시보드가 직접 찍는 점의 id 접두사
 const WAZUH_DOT_PREFIX = "wazuh:";
-// (9/30) Wazuh 탐지 IP를 기억하는 시간. Wazuh가 로그인 이벤트보다 먼저 도착하는 경우만 처리하면 되므로 짧게 둔다.
+// (9/29) Wazuh 탐지 IP를 기억하는 시간. Wazuh가 로그인 이벤트보다 먼저 도착하는 경우만 처리하면 되므로 짧게 둔다.
 // 이 시간이 지난 뒤 같은 IP로 정상 시간대에 로그인하면 다시 파란 점으로 찍힘.
 const ANOMALY_IP_TTL_MS = 60_000;
 
@@ -75,10 +75,24 @@ function isMock(id: string): boolean {
   return id.startsWith("evt-") || id.startsWith("alert-evt-");
 }
 
-// (9/30) Wazuh payload의 ruleId 문자열이 R-01~R-06 중 하나일 때만 RuleId로 인정
+// (9/29) Wazuh payload의 ruleId 문자열이 R-01~R-06 중 하나일 때만 RuleId로 인정
 const RULE_IDS: readonly string[] = ["R-01", "R-02", "R-03", "R-04", "R-05", "R-06"];
 function toRuleId(value: string): RuleId | undefined {
   return RULE_IDS.includes(value) ? (value as RuleId) : undefined;
+}
+
+// (9/29) 같은 로그인 1건인지 판별: 같은 IP이면서 (같은 세션이거나, 세션을 못 찾았으면 5초 이내 시각)
+// 인증서버는 이상 로그인 1건에 login:success(isAnomaly: true)와 login:anomaly를 따로 보내서
+// 같은 자리에 점이 2개 겹쳐 찍히던 문제를 막는 데 사용한다.
+const SAME_LOGIN_WINDOW_MS = 5_000;
+function isSameLogin(
+  a: { ip: string; sessionId: string; time: string },
+  b: { ip: string; sessionId: string; time: string }
+): boolean {
+  if (a.ip !== b.ip) return false;
+  if (a.sessionId && b.sessionId) return a.sessionId === b.sessionId;
+  const gap = Math.abs(new Date(a.time).getTime() - new Date(b.time).getTime());
+  return gap < SAME_LOGIN_WINDOW_MS;
 }
 
 function toProfile(trustLevel: string): Profile {
@@ -140,7 +154,7 @@ async function buildLoginEvent(
     geolocateIp(payload.ipAddress),
     fetchActiveSessions(payload.userId).catch(() => []),
   ]);
-  // ⚠️ 수정(9/30): 예전엔 그 유저의 "마지막 세션"을 무조건 가져와서, 같은 계정으로 여러 IP에서 로그인하면
+  // ⚠️ 수정(9/29): 예전엔 그 유저의 "마지막 세션"을 무조건 가져와서, 같은 계정으로 여러 IP에서 로그인하면
   // 서로 다른 점이 같은 sessionId를 갖게 됨 → 한 알림을 지우면 다른 IP 점까지 같이 사라지던 버그.
   // 이제는 로그인 IP와 같은 세션 중 가장 최근 것을 고르고, 없을 때만 마지막 세션으로 대체한다.
   const sameIp = sessions.filter((s) => s.ipAddress === payload.ipAddress);
@@ -239,18 +253,29 @@ export function useLiveDashboard() {
             reason: built.reason ?? wazuh.label,
           }
         : built;
-      // Wazuh가 먼저 와서 대시보드가 임시로 찍어둔 점(wazuh:)이 같은 IP에 있으면 실제 로그인 점으로 교체
-      setEvents((prev) =>
-        [
-          event,
-          ...prev.filter((e) => !(e.id.startsWith(WAZUH_DOT_PREFIX) && e.ip === event.ip)),
-        ].slice(0, MAX_EVENTS)
-      );
+      setEvents((prev) => {
+        // Wazuh가 먼저 와서 대시보드가 임시로 찍어둔 점(wazuh:)이 같은 IP에 있으면 실제 로그인 점으로 교체
+        const rest = prev.filter((e) => !(e.id.startsWith(WAZUH_DOT_PREFIX) && e.ip === event.ip));
+        // (9/29) 인증서버는 이상 로그인 1건에 login:success(isAnomaly: true)와 login:anomaly를 둘 다 보냄
+        // → login:anomaly 쪽 점이 이미 있으면(같은 로그인) 중복으로 안 찍음
+        if (rest.some((e) => !e.id.startsWith(WAZUH_DOT_PREFIX) && isSameLogin(e, event))) {
+          return rest;
+        }
+        return [event, ...rest].slice(0, MAX_EVENTS);
+      });
     };
 
     const handleAlertDetected = async (payload: LoginAnomalyPayload) => {
       const event = await buildLoginEvent(payload, "alert");
-      setEvents((prev) => [event, ...prev].slice(0, MAX_EVENTS));
+      // (9/29) 같은 로그인으로 먼저 찍힌 login:success 점은 이 점으로 교체 → 점 1개만 남김
+      setEvents((prev) =>
+        [
+          event,
+          ...prev.filter(
+            (e) => e.id !== event.id && (e.id.startsWith(WAZUH_DOT_PREFIX) || !isSameLogin(e, event))
+          ),
+        ].slice(0, MAX_EVENTS)
+      );
       setAlerts((prev) =>
         [
           {
@@ -288,7 +313,7 @@ export function useLiveDashboard() {
           {
             id: alertId,
             sessionId: "",
-            ruleId, // (9/30) 알림 삭제 시 지도에서 같은 IP·같은 룰로 빨개진 점을 찾기 위해 저장
+            ruleId, // (9/29) 알림 삭제 시 지도에서 같은 IP·같은 룰로 빨개진 점을 찾기 위해 저장
             ruleLabel,
             ip,
             country: payload.country ?? "",
@@ -315,7 +340,7 @@ export function useLiveDashboard() {
         return next;
       });
 
-      // ② (9/30) 최근 같은 IP 점이 없으면(로그인 이벤트가 안 왔거나 아직 도착 전) 위치를 조회해서 빨간 점을 직접 찍음
+      // ② (9/29) 최근 같은 IP 점이 없으면(로그인 이벤트가 안 왔거나 아직 도착 전) 위치를 조회해서 빨간 점을 직접 찍음
       //    사설 IP(10.x 등)는 위치 조회가 실패해서 (0,0)이 나오므로 지도에 안 찍음
       const geo = await geolocateIp(ip);
       if (geo.lat === 0 && geo.lng === 0) return;
@@ -358,30 +383,34 @@ export function useLiveDashboard() {
   }, []);
 
   /**
-   * 알림 삭제 (9/28 수정, 9/30 수정)
+   * 알림 삭제 (9/28 수정, 9/29 수정)
    * - 알림은 무조건 id 기준으로 삭제 → Wazuh 알림(sessionId 없음)도 정상 삭제됨
-   * - Wazuh 알림: 같은 IP + 같은 룰로 빨개진 지도 점(대시보드가 직접 찍은 wazuh: 점 포함)도 같이 삭제
-   * - 로그인 이상탐지 알림: 알림과 같은 id의 지도 점만 삭제 (예전엔 sessionId로 지워서
-   *   같은 세션으로 묶인 다른 IP 점까지 같이 사라지던 버그) + 세션 강제 종료 수행
+   * - 지도 점 삭제 기준 (하나라도 해당하면 삭제)
+   *   ① 알림과 같은 id의 점 (mock은 알림 id가 "alert-" + 점 id)
+   *   ② 로그인 이상탐지 알림: 같은 로그인의 점 (같은 IP + 같은 세션, 세션이 없으면 5초 이내 시각)
+   *      → login:success로 따로 찍힌 점까지 같이 삭제, 다른 IP 점은 안 지워짐
+   *   ③ Wazuh 알림: 같은 IP + 같은 룰로 빨개진 점 (대시보드가 직접 찍은 wazuh: 점 포함)
+   * - 세션이 있는 알림은 세션 강제 종료까지 수행
    */
   const handleDismiss = useCallback(
     async (alert: AlertEvent) => {
       setAlerts((prev) => prev.filter((a) => a.id !== alert.id));
 
+      setEvents((prev) =>
+        prev.filter((e) => {
+          if (e.id === alert.id || `alert-${e.id}` === alert.id) return false;
+          if (!alert.ruleId && !e.id.startsWith(WAZUH_DOT_PREFIX) && isSameLogin(e, alert)) return false;
+          if (!alert.sessionId && alert.ruleId && e.ip === alert.ip && e.ruleId === alert.ruleId) {
+            return false;
+          }
+          return true;
+        })
+      );
+
       if (!alert.sessionId) {
-        if (alert.ruleId && alert.ip !== "-") {
-          setEvents((prev) =>
-            prev.filter((e) => !(e.ip === alert.ip && e.ruleId === alert.ruleId))
-          );
-          anomalyIps.current.delete(alert.ip);
-        }
+        if (alert.ruleId) anomalyIps.current.delete(alert.ip);
         return;
       }
-
-      // 실데이터: 알림 id === 지도 점 id / mock: 알림 id === "alert-" + 지도 점 id
-      setEvents((prev) =>
-        prev.filter((e) => e.id !== alert.id && `alert-${e.id}` !== alert.id)
-      );
 
       // mock 알림(가짜 sessionId: sess-900x)은 서버에 세션 종료 요청을 보내지 않음
       if (usingMock || isMock(alert.id)) return;
